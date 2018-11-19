@@ -1,0 +1,65 @@
+#!/usr/bin/python
+
+import json
+import yaml
+import os
+import datetime
+import sys
+import logging
+from keystoneauth1 import loading
+from keystoneauth1 import session
+from heatclient import client
+
+FORMAT = '%(asctime)-15s %(levelname)-7s %(name)-5s %(message)s'
+logging.basicConfig(format=FORMAT, level=logging.INFO)
+_LOGGER = logging.getLogger("in").getChild("heat")
+
+def run():
+    """
+
+    ref: https://concourse.ci/implementing-resources.html#in
+    """
+    # Read input
+    input_raw_data = None
+    with sys.stdin as stdin:
+        input_raw_data = stdin.read()
+    input_data = json.loads(input_raw_data)
+    # Set variables
+    debug = input_data["source"].get("debug", False)
+    if debug:
+        _LOGGER.setLevel(logging.DEBUG)
+    _LOGGER.debug("`IN` for heat resource type started")
+
+    try:
+        auth_url = input_data["source"]["os_auth_url"]
+        username = input_data["source"]["os_username"]
+        password = input_data["source"]["os_password"]
+        project_id = input_data["source"]["os_project_id"]
+        stack_name = input_data["source"]["stack_name"]
+    except:
+        _LOGGER.error("Mandatory var is missing")
+        sys.exit(1)
+
+    try:
+        loader = loading.get_plugin_loader('password')
+        auth = loader.load_from_options(auth_url=auth_url,
+                                        username=username,
+                                        password=password,
+                                        project_id=project_id)
+        sess = session.Session(auth=auth)
+        heat = client.Client('1', session=sess)
+    except:
+        _LOGGER.error("Error in logging user : `%s` in project id: `%s`",
+                        username, project_id)
+        sys.exit(1)
+    try:
+        id = heat.stacks.get(stack_name).id
+        output = json.dumps({"version": {"id": id}, "metadata": [{}]})
+        _LOGGER.debug("output json: `%s`", output)
+        print(output)
+    except:
+        _LOGGER.error("Stack not found `%s`", stack_name)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    run()

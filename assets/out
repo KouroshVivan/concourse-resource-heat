@@ -1,0 +1,150 @@
+#!/usr/bin/python
+
+import json
+import yaml
+import os
+import datetime
+import sys
+import logging
+import time
+from keystoneauth1 import loading
+from keystoneauth1 import session
+from heatclient import client
+from heatclient.common import template_utils
+
+FORMAT = '%(asctime)-15s %(levelname)-7s %(name)-5s %(message)s'
+logging.basicConfig(format=FORMAT, level=logging.INFO)
+_LOGGER = logging.getLogger("out").getChild("heat")
+
+def wait_status(heat, input_data, status="COMPLETE", deleted=False):
+    _LOGGER.debug("Wait status `%s`", status)
+    stack_name = input_data["source"]["stack_name"]
+    max_retries = input_data["source"].get("max_retries", "20")
+    retry_interval = input_data["source"].get("retry_interval", "3")
+    reach_status = False
+    for iter in range(1, int(max_retries)):
+        try:
+            stack = heat.stacks.get(stack_name)
+            if not deleted and stack.status == status:
+                reach_status = True
+                _LOGGER.debug("Status ok after `%s` tries", iter)
+                break
+            _LOGGER.debug("[%s/%s] status = `%s`", iter, max_retries, stack.status)
+            time.sleep(float(retry_interval))
+        except:
+            #Case stack is deleted
+            break
+    else:
+        if deleted:
+            _LOGGER.debug("Stack is deleted")
+        else:
+            stack = heat.stacks.get(stack_name)
+            _LOGGER.error("Max retries number reach (%s), stack status is `%s`", max_retries, stack.status)
+            sys.exit(1)
+
+def action_create(heat, input_data, stack_name, validation_enabled):
+    _LOGGER.debug("action create for heat resource type started")
+    try:
+        environment = input_data["params"]["environment"]
+        template = input_data["params"]["template"]
+    except:
+        _LOGGER.error("Missing environment or template")
+        sys.exit(1)
+    try:
+        stack = heat.stacks.get(stack_name)
+    except:
+        path = '/tmp/build/put/'
+        os.chdir(path)
+        template_path = os.path.join(path, template)
+        environment_path = os.path.join(path, environment)
+        try:
+            with open(environment_path, 'r') as environment_file:
+                environment = yaml.load(environment_file.read())
+
+                files, template = template_utils.process_template_path(template_path)
+                try:
+                    stack = heat.stacks.create(stack_name=stack_name,
+                                               template=template,
+                                               environment=environment,
+                                               files=files)
+                except heatclient.exc.HTTPConflict as err:
+                    _LOGGER.error("Stack `%s` already exists : `%s`" , err.message , stack_name)
+                    sys.exit(1)
+                except heatclient.exc.HTTPBadRequest as err:
+                    _LOGGER.error("Bad request : `%s`", err.message)
+                    sys.exit(1)
+        except IOError as err:
+            _LOGGER.error("Cannot open file `%s`", err.message)
+            sys.exit(1)
+    if validation_enabled:
+        wait_status(heat, input_data=input_data)
+    id = heat.stacks.get(stack_name).id
+    _LOGGER.debug("Create end, stack id: `%s`", id)
+    return {"id": id}
+
+def action_delete(heat, input_data, stack_name, validation_enabled):
+    _LOGGER.debug("action delete for heat resource type started")
+    try:
+        stack = heat.stacks.get(stack_name)
+        id = stack.id
+    except:
+        _LOGGER.error("Cannot find stack named: `%s`", stack_name)
+        sys.exit(1)
+    stack.delete()
+    if validation_enabled:
+        wait_status(heat, input_data=input_data, deleted=True)
+    _LOGGER.debug("Delete end, stack id: `%s`", id)
+    return {"id": id}
+
+def run():
+    """
+
+    ref: https://concourse.ci/implementing-resources.html#out
+    """
+    # Read input
+    input_raw_data = None
+    with sys.stdin as stdin:
+        input_raw_data = stdin.read()
+    input_data = json.loads(input_raw_data)
+    # Set variables
+    debug = input_data["source"].get("debug", False)
+    validation_enabled = input_data["source"].get("validation", False)
+    if debug:
+        _LOGGER.setLevel(logging.DEBUG)
+    _LOGGER.debug("`OUT` for heat resource type started")
+
+    try:
+        auth_url = input_data["source"]["os_auth_url"]
+        username = input_data["source"]["os_username"]
+        password = input_data["source"]["os_password"]
+        project_id = input_data["source"]["os_project_id"]
+        stack_name = input_data["source"]["stack_name"]
+        action = input_data["params"]["action"]
+    except:
+        _LOGGER.error("Mandatory var is missing")
+        sys.exit(1)
+
+    try:
+        loader = loading.get_plugin_loader('password')
+        auth = loader.load_from_options(auth_url=auth_url,
+                                        username=username,
+                                        password=password,
+                                        project_id=project_id)
+        sess = session.Session(auth=auth)
+        heat = client.Client('1', session=sess)
+    except:
+        _LOGGER.error("Error in logging user : `%s` in project id: `%s`",
+                        username, project_id)
+        sys.exit(1)
+
+    if action == "create":
+        id = action_create(heat, input_data, stack_name, validation_enabled)
+    elif action == "delete":
+        id = action_delete(heat, input_data, stack_name, validation_enabled)
+
+    output = json.dumps({"version": id})
+    _LOGGER.debug("output json: `%s`", output)
+    print(output)
+
+if __name__ == '__main__':
+    run()
